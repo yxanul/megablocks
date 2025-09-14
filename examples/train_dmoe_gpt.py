@@ -215,6 +215,14 @@ class TrainConfig:
     log_interval: int = 100
     eval_interval: int = 1000
     ckpt_dir: Optional[str] = None
+    # Logging
+    wandb: bool = False
+    wandb_project: Optional[str] = None
+    wandb_run_name: Optional[str] = None
+    wandb_entity: Optional[str] = None
+    wandb_tags: Optional[str] = None  # comma-separated
+    # Router/expert weight behavior
+    moe_normalize_expert_weights: Optional[float] = None  # e.g., 2 for L2 norm
 
 
 def cosine_lr(step: int, max_steps: int, lr: float, min_lr: float, warmup: int) -> float:
@@ -233,6 +241,7 @@ def create_dmoe_args(cfg: TrainConfig, device: torch.device) -> Arguments:
         moe_top_k=cfg.top_k,
         moe_loss_weight=cfg.moe_loss_weight,
         moe_zloss_weight=cfg.moe_zloss_weight,
+        moe_normalize_expert_weights=cfg.moe_normalize_expert_weights,
         moe_expert_model_parallelism=False,
         pipeline_model_parallel_size=1,
         memory_optimized_mlp=True,
@@ -289,6 +298,28 @@ def train(cfg: TrainConfig):
         dropout=cfg.dropout,
     ).to(device)
 
+    # Print parameter counts
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"model params | total {total_params/1e6:.2f}M | trainable {trainable_params/1e6:.2f}M")
+
+    # Optional Weights & Biases
+    wandb_run = None
+    if cfg.wandb:
+        try:
+            import wandb  # type: ignore
+            wandb_kwargs = {
+                "project": cfg.wandb_project or "megablocks-dmoe",
+                "name": cfg.wandb_run_name,
+                "entity": cfg.wandb_entity,
+                "config": cfg.__dict__,
+            }
+            if cfg.wandb_tags:
+                wandb_kwargs["tags"] = [t.strip() for t in cfg.wandb_tags.split(",") if t.strip()]
+            wandb_run = wandb.init(**{k: v for k, v in wandb_kwargs.items() if v is not None})
+        except Exception as e:
+            print(f"W&B init failed ({e}); continuing without wandb logging.")
+
     # Optimizer
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=cfg.lr, betas=cfg.betas, weight_decay=cfg.weight_decay
@@ -298,6 +329,9 @@ def train(cfg: TrainConfig):
     # Training loop
     global_step = 0
     model.train()
+    import time
+    last_log_time = time.perf_counter()
+    tokens_since_log = 0
     while global_step < cfg.max_steps:
         for it, (x, y) in enumerate(train_loader):
             x = x.to(device, non_blocking=True)
@@ -339,11 +373,36 @@ def train(cfg: TrainConfig):
             clear_load_balancing_loss()
             clear_router_zloss()
 
+            tokens_since_log += x.size(0) * x.size(1)
             if (global_step + 1) % cfg.log_interval == 0:
+                torch.cuda.synchronize()
+                now = time.perf_counter()
+                elapsed = max(1e-6, now - last_log_time)
+                toks_per_s = tokens_since_log / elapsed
                 ppl = math.exp(loss_lm.item()) if loss_lm.item() < 20 else float("inf")
-                print(
-                    f"step {global_step+1} | lr {lr_now:.3e} | loss {loss.item():.4f} | lm {loss_lm.item():.4f} | ppl {ppl:.2f}"
+                lbl_val = float(loss_lbl.item()) if isinstance(loss_lbl, torch.Tensor) else float(loss_lbl)
+                z_val = float(loss_z.item()) if isinstance(loss_z, torch.Tensor) else float(loss_z)
+                msg = (
+                    f"step {global_step+1} | lr {lr_now:.3e} | loss {loss.item():.4f} | "
+                    f"lm {loss_lm.item():.4f} | lbl {lbl_val:.6f} | z {z_val:.6f} | ppl {ppl:.2f} | tok/s {toks_per_s:,.0f}"
                 )
+                print(msg)
+                if wandb_run is not None:
+                    try:
+                        wandb_run.log({
+                            "step": global_step + 1,
+                            "lr": lr_now,
+                            "loss": loss.item(),
+                            "loss_lm": loss_lm.item(),
+                            "loss_lbl": lbl_val,
+                            "loss_z": z_val,
+                            "ppl": (math.exp(loss_lm.item()) if loss_lm.item() < 20 else None),
+                            "tokens_per_sec": toks_per_s,
+                        }, step=global_step + 1)
+                    except Exception:
+                        pass
+                last_log_time = now
+                tokens_since_log = 0
 
             if cfg.eval_interval and (global_step + 1) % cfg.eval_interval == 0 and val_loader is not None:
                 evaluate(model, val_loader, dmoe_args, cfg, device)
@@ -422,6 +481,14 @@ def parse_args() -> TrainConfig:
     p.add_argument("--log-interval", type=int, default=100)
     p.add_argument("--eval-interval", type=int, default=1000)
     p.add_argument("--ckpt-dir", type=str, default=None)
+    # Logging
+    p.add_argument("--wandb", action="store_true", default=False)
+    p.add_argument("--wandb-project", type=str, default=None)
+    p.add_argument("--wandb-run-name", type=str, default=None)
+    p.add_argument("--wandb-entity", type=str, default=None)
+    p.add_argument("--wandb-tags", type=str, default=None)
+    # Router/expert weight behavior
+    p.add_argument("--moe-normalize-expert-weights", type=float, default=None)
 
     a = p.parse_args()
     return TrainConfig(
@@ -455,6 +522,12 @@ def parse_args() -> TrainConfig:
         log_interval=a.log_interval,
         eval_interval=a.eval_interval,
         ckpt_dir=a.ckpt_dir,
+        wandb=a.wandb,
+        wandb_project=a.wandb_project,
+        wandb_run_name=a.wandb_run_name,
+        wandb_entity=a.wandb_entity,
+        wandb_tags=a.wandb_tags,
+        moe_normalize_expert_weights=a.moe_normalize_expert_weights,
     )
 
 
