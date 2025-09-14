@@ -1,8 +1,15 @@
 import argparse
 import math
 import os
+import sys
 from dataclasses import dataclass
 from typing import Optional, Tuple
+
+# Ensure repo root is on sys.path when running as a script
+_THIS_DIR = os.path.dirname(__file__)
+_REPO_ROOT = os.path.abspath(os.path.join(_THIS_DIR, os.pardir))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 import numpy as np
 import torch
@@ -240,8 +247,13 @@ def create_dmoe_args(cfg: TrainConfig, device: torch.device) -> Arguments:
 
 def train(cfg: TrainConfig):
     assert torch.cuda.is_available(), "CUDA is required for dMoE kernels"
-    device = torch.device(cfg.device)
-    torch.cuda.set_device(device)
+    # Normalize device string: allow "cuda" -> "cuda:0"
+    device_str = cfg.device
+    if device_str.startswith("cuda") and (":" not in device_str or device_str.endswith(":")):
+        device_str = "cuda:0"
+    device = torch.device(device_str)
+    # set_device expects an index or a device with an index
+    torch.cuda.set_device(device.index if device.index is not None else 0)
 
     # Data: if no val.bin provided, split 1% from train.bin for validation.
     base_ds = BinTokenDataset(cfg.train_bin, cfg.seq_len, dtype=cfg.bin_dtype)
@@ -334,7 +346,7 @@ def train(cfg: TrainConfig):
                 )
 
             if cfg.eval_interval and (global_step + 1) % cfg.eval_interval == 0 and val_loader is not None:
-                evaluate(model, val_loader, dmoe_args, cfg)
+                evaluate(model, val_loader, dmoe_args, cfg, device)
 
             if cfg.ckpt_dir and (global_step + 1) % cfg.eval_interval == 0:
                 os.makedirs(cfg.ckpt_dir, exist_ok=True)
@@ -350,15 +362,15 @@ def train(cfg: TrainConfig):
 
 
 @torch.no_grad()
-def evaluate(model: nn.Module, loader, dmoe_args: Arguments, cfg: TrainConfig):
+def evaluate(model: nn.Module, loader, dmoe_args: Arguments, cfg: TrainConfig, device: torch.device):
     model.eval()
     total_loss = 0.0
     n = 0
     autocast_dtype = torch.float16 if cfg.fp16 else (torch.bfloat16 if cfg.bf16 else None)
     ctx = torch.cuda.amp.autocast(enabled=autocast_dtype is not None, dtype=autocast_dtype)
     for x, y in loader:
-        x = x.to(cfg.device, non_blocking=True)
-        y = y.to(cfg.device, non_blocking=True)
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
         with ctx:
             logits = model(x)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1), ignore_index=-1)
